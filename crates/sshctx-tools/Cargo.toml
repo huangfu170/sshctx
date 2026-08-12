@@ -1,0 +1,20 @@
+[package]
+name = "sshctx-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+hex.workspace = true
+ignore.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sshctx-budget = { path = "../sshctx-budget" }
+sshctx-protocol = { path = "../sshctx-protocol" }
+sshctx-ssh = { path = "../sshctx-ssh" }
+tokio.workspace = true

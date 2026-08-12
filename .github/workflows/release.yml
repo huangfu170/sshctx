@@ -1,0 +1,23 @@
+name: Release
+on:
+  push:
+    tags: ["v0.*.*"]
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - shell: pwsh
+        run: ./scripts/package.ps1
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/sshctx.exe
+            dist/sshctx.exe.sha256
+            dist/agent.py
+            dist/agent.py.sha256
+

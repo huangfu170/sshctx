@@ -1,0 +1,9 @@
+[hosts.fixture]
+address = "127.0.0.1"
+port = 22
+username = "fixture"
+identity_file = "fixtures/id_ed25519"
+python = "python3"
+allowed_roots = ["/tmp/sshctx"]
+max_operations = 2
+
