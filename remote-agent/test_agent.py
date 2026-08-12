@@ -30,7 +30,18 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(payload, b"abc")
             self.assertIsNone(metadata["next_byte_offset"])
 
+    def test_chunk_resume_and_commit(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = agent.Agent([root])
+            target = pathlib.Path(root) / "nested" / "large.bin"
+            service.op_write_chunk({"path": str(target), "offset": 0, "reset": True}, b"abc")
+            status, _ = service.op_chunk_status({"path": str(target)}, b"")
+            self.assertEqual(status["offset"], 3)
+            service.op_write_chunk({"path": str(target), "offset": 3}, b"def")
+            digest = agent.hashlib.sha256(b"abcdef").hexdigest()
+            service.op_commit_chunks({"path": str(target), "sha256": digest}, b"")
+            self.assertEqual(target.read_bytes(), b"abcdef")
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -14,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use tokio::io::AsyncWriteExt;
 
 #[derive(Clone)]
 pub struct ToolService {
@@ -209,14 +210,8 @@ impl ToolService {
                 continue;
             }
             let remote = format!("{}/{}", request.remote_path.trim_end_matches('/'), relative);
-            self.request(
-                &request.host,
-                "write_atomic",
-                json!({"path":remote,"sha256":hash}),
-                Bytes::from(content.clone()),
-                false,
-            )
-            .await?;
+            self.upload_bytes(&request.host, &remote, &content, &hash)
+                .await?;
             changed += 1;
             bytes += content.len();
         }
@@ -246,26 +241,59 @@ impl ToolService {
             .context("invalid manifest")?;
         let mut count = 0usize;
         let mut bytes = 0usize;
-        for relative in entries.keys() {
+        for (relative, entry) in entries {
             let destination = safe_local_join(&canonical, relative)?;
             if let Some(parent) = destination.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
             let remote = format!("{}/{}", request.remote_path.trim_end_matches('/'), relative);
-            let response = self
-                .request(
-                    &request.host,
-                    "read",
-                    json!({"path":remote,"byte_limit":sshctx_protocol::MAX_PAYLOAD}),
-                    Bytes::new(),
-                    true,
-                )
-                .await?;
+            let expected_size = entry
+                .get("size")
+                .and_then(Value::as_u64)
+                .context("manifest size missing")?;
+            let expected_hash = entry
+                .get("sha256")
+                .and_then(Value::as_str)
+                .context("manifest hash missing")?;
+            if destination.is_file() {
+                let existing = tokio::fs::read(&destination).await?;
+                if existing.len() as u64 == expected_size && hex_sha256(&existing) == expected_hash
+                {
+                    continue;
+                }
+            }
             let temp = destination.with_extension("sshctx-part");
-            tokio::fs::write(&temp, &response.payload).await?;
+            let mut output = tokio::fs::File::create(&temp).await?;
+            let mut offset = 0_u64;
+            let mut hasher = Sha256::new();
+            while offset < expected_size {
+                let response = self
+                    .request(
+                        &request.host,
+                        "read",
+                        json!({"path":remote,"byte_offset":offset,"byte_limit":8*1024*1024}),
+                        Bytes::new(),
+                        true,
+                    )
+                    .await?;
+                if response.payload.is_empty() {
+                    bail!("remote file ended before manifest size");
+                }
+                output.write_all(&response.payload).await?;
+                hasher.update(&response.payload);
+                offset += response.payload.len() as u64;
+            }
+            output.flush().await?;
+            output.sync_all().await?;
+            drop(output);
+            let actual_hash = format!("{:x}", hasher.finalize());
+            if actual_hash != expected_hash {
+                let _ = tokio::fs::remove_file(&temp).await;
+                bail!("remote file changed during pull: {relative}");
+            }
             tokio::fs::rename(&temp, &destination).await?;
             count += 1;
-            bytes += response.payload.len();
+            bytes += expected_size as usize;
         }
         Ok(format!(
             "files={count}\ntransferred_bytes={bytes}\n(Complete: sync pull finished.)"
@@ -273,6 +301,13 @@ impl ToolService {
     }
 
     pub async fn transfer(&self, request: TransferRequest) -> Result<String> {
+        if request
+            .verify
+            .as_deref()
+            .is_some_and(|value| value != "sha256")
+        {
+            bail!("verify must be sha256 when provided");
+        }
         let source_stat = self
             .request(
                 &request.source_host,
@@ -282,42 +317,198 @@ impl ToolService {
                 true,
             )
             .await?;
-        let size = source_stat
+        let kind = source_stat
             .header
             .result
-            .get("size")
-            .and_then(Value::as_u64)
-            .context("source size unavailable")?;
-        let mut offset = 0_u64;
-        let mut hasher = Sha256::new();
-        while offset < size {
-            let read = self.request(&request.source_host, "read", json!({"path":request.source_path,"byte_offset":offset,"byte_limit":8*1024*1024}), Bytes::new(), true).await?;
-            if read.payload.is_empty() {
-                bail!("source ended before advertised size");
-            }
-            hasher.update(&read.payload);
+            .get("kind")
+            .and_then(Value::as_str)
+            .context("source kind unavailable")?;
+        if kind == "file" {
+            let size = source_stat
+                .header
+                .result
+                .get("size")
+                .and_then(Value::as_u64)
+                .context("source size unavailable")?;
+            let (hash, resumed) = self
+                .transfer_file(
+                    &request.source_host,
+                    &request.source_path,
+                    &request.destination_host,
+                    &request.destination_path,
+                    size,
+                    request.resume,
+                )
+                .await?;
+            return Ok(format!(
+                "files=1\ntransferred_bytes={size}\nresumed_bytes={resumed}\nsha256={hash}\n(Complete: host-to-host transfer verified.)"
+            ));
+        }
+        if kind != "dir" {
+            bail!("source must be a regular file or directory");
+        }
+        let manifest = self
+            .request(
+                &request.source_host,
+                "manifest",
+                json!({"path":request.source_path}),
+                Bytes::new(),
+                true,
+            )
+            .await?;
+        let entries = manifest
+            .header
+            .result
+            .get("entries")
+            .and_then(Value::as_object)
+            .context("invalid source manifest")?;
+        let mut files = 0usize;
+        let mut bytes = 0_u64;
+        let mut resumed = 0_u64;
+        for (relative, entry) in entries {
+            let size = entry
+                .get("size")
+                .and_then(Value::as_u64)
+                .context("manifest size missing")?;
+            let source = format!("{}/{}", request.source_path.trim_end_matches('/'), relative);
+            let destination = format!(
+                "{}/{}",
+                request.destination_path.trim_end_matches('/'),
+                relative
+            );
+            let (_, resumed_file) = self
+                .transfer_file(
+                    &request.source_host,
+                    &source,
+                    &request.destination_host,
+                    &destination,
+                    size,
+                    request.resume,
+                )
+                .await?;
+            files += 1;
+            bytes += size;
+            resumed += resumed_file;
+        }
+        Ok(format!(
+            "files={files}\ntransferred_bytes={bytes}\nresumed_bytes={resumed}\n(Complete: directory transfer verified file-by-file with SHA-256.)"
+        ))
+    }
+
+    async fn upload_bytes(&self, host: &str, path: &str, content: &[u8], hash: &str) -> Result<()> {
+        if content.len() <= sshctx_protocol::MAX_PAYLOAD {
             self.request(
-                &request.destination_host,
-                "write_chunk",
-                json!({"path":request.destination_path,"offset":offset}),
-                read.payload.clone(),
+                host,
+                "write_atomic",
+                json!({"path":path,"sha256":hash}),
+                Bytes::copy_from_slice(content),
                 false,
             )
             .await?;
-            offset += read.payload.len() as u64;
+            return Ok(());
         }
-        let hash = format!("{:x}", hasher.finalize());
+        let mut offset = 0usize;
+        for chunk in content.chunks(8 * 1024 * 1024) {
+            self.request(
+                host,
+                "write_chunk",
+                json!({"path":path,"offset":offset,"reset":offset == 0}),
+                Bytes::copy_from_slice(chunk),
+                false,
+            )
+            .await?;
+            offset += chunk.len();
+        }
         self.request(
-            &request.destination_host,
+            host,
             "commit_chunks",
-            json!({"path":request.destination_path,"sha256":hash}),
+            json!({"path":path,"sha256":hash}),
             Bytes::new(),
             false,
         )
         .await?;
-        Ok(format!(
-            "transferred_bytes={size}\nsha256={hash}\n(Complete: host-to-host transfer verified.)"
-        ))
+        Ok(())
+    }
+
+    async fn transfer_file(
+        &self,
+        source_host: &str,
+        source_path: &str,
+        destination_host: &str,
+        destination_path: &str,
+        size: u64,
+        resume: bool,
+    ) -> Result<(String, u64)> {
+        let mut resume_offset = 0_u64;
+        let mut reset_required = !resume;
+        if resume {
+            let status = self
+                .request(
+                    destination_host,
+                    "chunk_status",
+                    json!({"path":destination_path}),
+                    Bytes::new(),
+                    true,
+                )
+                .await?;
+            let remote_offset = status
+                .header
+                .result
+                .get("offset")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if remote_offset <= size {
+                resume_offset = remote_offset;
+            } else {
+                reset_required = true;
+            }
+        }
+        let mut offset = 0_u64;
+        let mut hasher = Sha256::new();
+        let mut first_write = true;
+        if size == 0 {
+            self.request(
+                destination_host,
+                "write_chunk",
+                json!({"path":destination_path,"offset":0,"reset":true}),
+                Bytes::new(),
+                false,
+            )
+            .await?;
+        }
+        while offset < size {
+            let read = self
+                .request(
+                    source_host,
+                    "read",
+                    json!({"path":source_path,"byte_offset":offset,"byte_limit":8*1024*1024}),
+                    Bytes::new(),
+                    true,
+                )
+                .await?;
+            if read.payload.is_empty() {
+                bail!("source ended before advertised size");
+            }
+            hasher.update(&read.payload);
+            let end = offset + read.payload.len() as u64;
+            if end > resume_offset {
+                let start = resume_offset.saturating_sub(offset) as usize;
+                let write_offset = offset + start as u64;
+                self.request(destination_host, "write_chunk", json!({"path":destination_path,"offset":write_offset,"reset":reset_required && first_write}), read.payload.slice(start..), false).await?;
+                first_write = false;
+            }
+            offset = end;
+        }
+        let hash = format!("{:x}", hasher.finalize());
+        self.request(
+            destination_host,
+            "commit_chunks",
+            json!({"path":destination_path,"sha256":hash}),
+            Bytes::new(),
+            false,
+        )
+        .await?;
+        Ok((hash, resume_offset))
     }
 
     pub async fn agent_update(&self, request: HostRequest) -> Result<String> {

@@ -23,6 +23,8 @@ The project targets Windows 10/11 locally and Linux with Python 3.9+ remotely. I
 
 OpenSSH is still used for authentication, host-key verification, and transport. `scp` is used only when the versioned agent is missing or its SHA-256 does not match.
 
+Requests on one host are multiplexed by request ID over that single process. The Python agent executes independent operations concurrently and may return responses out of order; the Rust dispatcher routes each response to its waiting MCP call.
+
 ## Install
 
 Build from source with Rust 1.88 or newer:
@@ -123,7 +125,7 @@ Only an sshctx job ID is accepted by `remote_job_kill`; arbitrary PIDs cannot be
 
 Push sync honors `.gitignore` and `.sshctxignore`, and excludes `.git`, `models`, `data`, `outputs`, `logs`, `target`, and `__pycache__` by default. Files are SHA-256 compared, uploaded over the persistent framed connection, verified, fsynced, and atomically replaced. Version 0.1 refuses `delete=true`.
 
-Host-to-host transfer uses 8 MiB binary chunks and verifies the assembled SHA-256 on the destination. The data passes through memory in `runtime-host`; the complete file is never stored on Windows.
+Host-to-host transfer supports files and directory manifests, uses 8 MiB binary chunks, resumes from the destination's `.sshctx-part` length when requested, and verifies the assembled SHA-256 on the destination. The data passes through memory in `runtime-host`; the complete file is never stored on Windows.
 
 ## Security model
 
@@ -133,6 +135,7 @@ Host-to-host transfer uses 8 MiB binary chunks and verifies the assembled SHA-25
 - Read-only requests may be retried once after reconnect. Mutations, job starts, and kills are never automatically replayed.
 - MCP tool annotations distinguish read-only tools from operations that should require approval in the host.
 - Secrets are not written by the remote job supervisor; environment values stay in its mode-0700 job directory. Operators should still avoid placing long-lived secrets directly in tool arguments.
+- `~/.sshctx/audit.jsonl` records start/completion, alias, operation, cwd/path, a redacted command summary, exit code, and error status. It never records argv contents beyond the executable/count, shell command text, keys, or environment values.
 
 ## Development
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import fnmatch
 import hashlib
 import json
@@ -15,6 +16,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import uuid
@@ -24,6 +26,16 @@ MAGIC = b"SCX1"
 MAX_HEADER = 8 * 1024 * 1024
 MAX_PAYLOAD = 256 * 1024 * 1024
 AGENT_VERSION = "0.1.0"
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(8 * 1024 * 1024)
+            if not chunk: break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _read_exact(stream: BinaryIO, size: int) -> bytes:
@@ -150,12 +162,12 @@ class Agent:
                     "stderr": (error.stderr or b"").decode("utf-8", "replace")}, b""
 
     def op_manifest(self, params: Dict[str, Any], payload: bytes) -> Tuple[Any, bytes]:
-        root = self.path(params["path"])
+        root = self.path(params["path"], may_not_exist=True)
         entries = {}
         if root.exists():
             for path in root.rglob("*"):
                 if path.is_file():
-                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                    digest = sha256_file(path)
                     entries[path.relative_to(root).as_posix()] = {"sha256": digest, "size": path.stat().st_size}
         return {"entries": entries}, b""
 
@@ -184,6 +196,10 @@ class Agent:
         destination.parent.mkdir(parents=True, exist_ok=True)
         part = destination.parent / (destination.name + ".sshctx-part")
         offset = max(0, int(params.get("offset", 0)))
+        if params.get("reset"):
+            if offset != 0: raise ValueError("reset requires offset=0")
+            try: part.unlink()
+            except FileNotFoundError: pass
         mode = "r+b" if part.exists() else "w+b"
         with part.open(mode) as handle:
             handle.seek(0, os.SEEK_END)
@@ -193,10 +209,15 @@ class Agent:
             handle.write(payload); handle.flush(); os.fsync(handle.fileno())
         return {"path": str(destination), "next_offset": offset + len(payload)}, b""
 
+    def op_chunk_status(self, params: Dict[str, Any], payload: bytes) -> Tuple[Any, bytes]:
+        destination = self.path(params["path"], may_not_exist=True)
+        part = destination.parent / (destination.name + ".sshctx-part")
+        return {"path": str(destination), "offset": part.stat().st_size if part.exists() else 0}, b""
+
     def op_commit_chunks(self, params: Dict[str, Any], payload: bytes) -> Tuple[Any, bytes]:
         destination = self.path(params["path"], may_not_exist=True)
         part = destination.parent / (destination.name + ".sshctx-part")
-        actual = hashlib.sha256(part.read_bytes()).hexdigest()
+        actual = sha256_file(part)
         if actual != params["sha256"]: raise ValueError("assembled file SHA-256 mismatch")
         os.replace(part, destination)
         return {"path": str(destination), "sha256": actual, "bytes": destination.stat().st_size}, b""
@@ -290,11 +311,10 @@ class Agent:
 def serve(allowed_roots: Iterable[str]) -> int:
     agent = Agent(allowed_roots)
     source, sink = sys.stdin.buffer, sys.stdout.buffer
-    while True:
-        try:
-            request, payload = read_frame(source)
-        except EOFError:
-            return 0
+    sink_lock = threading.Lock()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="sshctx")
+
+    def respond(request: Dict[str, Any], payload: bytes) -> None:
         try:
             result, response_payload = agent.dispatch(request["method"], request.get("params", {}), payload)
             response = {"id": request["id"], "ok": True, "result": result, "error": None, "metadata": {"agent_version": AGENT_VERSION}}
@@ -302,7 +322,16 @@ def serve(allowed_roots: Iterable[str]) -> int:
             response_payload = b""
             response = {"id": request.get("id", ""), "ok": False, "result": None, "error": str(error),
                         "metadata": {"error_type": type(error).__name__}}
-        write_frame(sink, response, response_payload)
+        with sink_lock:
+            write_frame(sink, response, response_payload)
+
+    while True:
+        try:
+            request, payload = read_frame(source)
+        except EOFError:
+            executor.shutdown(wait=False)
+            return 0
+        executor.submit(respond, request, payload)
 
 
 def run_job(job_dir_raw: str) -> int:

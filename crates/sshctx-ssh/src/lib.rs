@@ -8,15 +8,18 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sshctx_protocol::{Frame, Request, Response, read_frame, write_frame};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::{
     io::{BufReader, BufWriter},
-    process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex, Semaphore},
+    process::{Child, ChildStdin, Command},
+    sync::{Mutex, Semaphore, oneshot},
     time::{Duration, timeout},
 };
 use uuid::Uuid;
@@ -97,15 +100,17 @@ impl Config {
 }
 
 struct Connection {
-    child: Child,
-    input: BufWriter<ChildStdin>,
-    output: BufReader<ChildStdout>,
+    child: Mutex<Child>,
+    input: Mutex<BufWriter<ChildStdin>>,
+    pending: Arc<Mutex<HashMap<String, ResponseSender>>>,
+    dead: Arc<AtomicBool>,
 }
+type ResponseSender = oneshot::Sender<std::result::Result<Frame<Response>, String>>;
 
 pub struct HostHandle {
     alias: String,
     config: HostConfig,
-    connection: Mutex<Option<Connection>>,
+    connection: Mutex<Option<Arc<Connection>>>,
     operations: Semaphore,
 }
 
@@ -218,25 +223,39 @@ impl RemoteBackend for ConnectionPool {
 
 impl HostHandle {
     async fn call_once(&self, request: Request, payload: Bytes) -> Result<Frame<Response>> {
-        let mut slot = self.connection.lock().await;
-        if slot.is_none() {
-            *slot = Some(self.connect().await?);
-        }
-        let connection = slot.as_mut().expect("connection initialized");
-        write_frame(
-            &mut connection.input,
+        let connection = {
+            let mut slot = self.connection.lock().await;
+            if slot
+                .as_ref()
+                .is_none_or(|connection| connection.dead.load(Ordering::Acquire))
+            {
+                *slot = Some(self.connect().await?);
+            }
+            Arc::clone(slot.as_ref().expect("connection initialized"))
+        };
+        let (sender, receiver) = oneshot::channel();
+        connection
+            .pending
+            .lock()
+            .await
+            .insert(request.id.clone(), sender);
+        let write_result = write_frame(
+            &mut *connection.input.lock().await,
             &Frame {
                 header: request.clone(),
                 payload,
             },
         )
-        .await?;
-        let response: Frame<Response> = timeout(
-            Duration::from_secs(24 * 60 * 60),
-            read_frame(&mut connection.output),
-        )
-        .await
-        .context("remote request timed out")??;
+        .await;
+        if let Err(error) = write_result {
+            connection.pending.lock().await.remove(&request.id);
+            return Err(error.into());
+        }
+        let response = timeout(Duration::from_secs(24 * 60 * 60), receiver)
+            .await
+            .context("remote request timed out")?
+            .context("remote response dispatcher stopped")?
+            .map_err(anyhow::Error::msg)?;
         if response.header.id != request.id {
             bail!("response id mismatch");
         }
@@ -244,12 +263,13 @@ impl HostHandle {
     }
 
     async fn disconnect(&self) {
-        if let Some(mut connection) = self.connection.lock().await.take() {
-            let _ = connection.child.kill().await;
+        if let Some(connection) = self.connection.lock().await.take() {
+            connection.dead.store(true, Ordering::Release);
+            let _ = connection.child.lock().await.kill().await;
         }
     }
 
-    async fn connect(&self) -> Result<Connection> {
+    async fn connect(&self) -> Result<Arc<Connection>> {
         self.deploy_agent().await?;
         let mut command = Command::new(ssh_program());
         append_common_args(&mut command, &self.config);
@@ -268,12 +288,38 @@ impl HostHandle {
             .spawn()
             .with_context(|| format!("start persistent ssh for {}", self.alias))?;
         let input = BufWriter::new(child.stdin.take().context("ssh stdin unavailable")?);
-        let output = BufReader::new(child.stdout.take().context("ssh stdout unavailable")?);
-        Ok(Connection {
-            child,
-            input,
-            output,
-        })
+        let mut output = BufReader::new(child.stdout.take().context("ssh stdout unavailable")?);
+        let pending = Arc::new(Mutex::new(HashMap::<String, ResponseSender>::new()));
+        let dead = Arc::new(AtomicBool::new(false));
+        let reader_pending = Arc::clone(&pending);
+        let reader_dead = Arc::clone(&dead);
+        tokio::spawn(async move {
+            loop {
+                let response: std::result::Result<Frame<Response>, _> =
+                    read_frame(&mut output).await;
+                match response {
+                    Ok(frame) => {
+                        if let Some(sender) = reader_pending.lock().await.remove(&frame.header.id) {
+                            let _ = sender.send(Ok(frame));
+                        }
+                    }
+                    Err(error) => {
+                        reader_dead.store(true, Ordering::Release);
+                        let message = error.to_string();
+                        for (_, sender) in reader_pending.lock().await.drain() {
+                            let _ = sender.send(Err(message.clone()));
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Arc::new(Connection {
+            child: Mutex::new(child),
+            input: Mutex::new(input),
+            pending,
+            dead,
+        }))
     }
 
     async fn deploy_agent(&self) -> Result<()> {

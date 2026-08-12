@@ -6,7 +6,6 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 use sshctx_protocol::{Frame, Request, Response, read_frame, write_frame};
 use sshctx_ssh::{ConnectionPool, RemoteBackend};
-#[cfg(unix)]
 use std::path::PathBuf;
 use std::{
     sync::{
@@ -16,7 +15,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
+    fs::OpenOptions,
+    io::AsyncWriteExt,
     io::{AsyncRead, AsyncWrite},
+    sync::Mutex,
     time::{Duration, sleep},
 };
 use uuid::Uuid;
@@ -26,6 +28,29 @@ const IDLE_SECONDS: u64 = 600;
 struct ActiveRequest {
     active: Arc<AtomicUsize>,
     activity: Arc<AtomicU64>,
+}
+
+struct AuditLog {
+    path: PathBuf,
+    lock: Mutex<()>,
+}
+impl AuditLog {
+    async fn append(&self, value: Value) -> Result<()> {
+        let _guard = self.lock.lock().await;
+        if let Some(parent) = self.path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await?;
+        file.write_all(serde_json::to_string(&value)?.as_bytes())
+            .await?;
+        file.write_all(b"\n").await?;
+        file.flush().await?;
+        Ok(())
+    }
 }
 impl Drop for ActiveRequest {
     fn drop(&mut self) {
@@ -120,6 +145,12 @@ pub async fn run_host(config: sshctx_ssh::Config, endpoint: String) -> Result<()
     let pool = Arc::new(ConnectionPool::new(config));
     let last_activity = Arc::new(AtomicU64::new(now()));
     let active = Arc::new(AtomicUsize::new(0));
+    let audit = Arc::new(AuditLog {
+        path: dirs::home_dir()
+            .context("home directory unavailable")?
+            .join(".sshctx/audit.jsonl"),
+        lock: Mutex::new(()),
+    });
     let idle = Arc::clone(&last_activity);
     let idle_active = Arc::clone(&active);
     tokio::spawn(async move {
@@ -132,7 +163,7 @@ pub async fn run_host(config: sshctx_ssh::Config, endpoint: String) -> Result<()
             }
         }
     });
-    listen(endpoint, pool, last_activity, active).await
+    listen(endpoint, pool, last_activity, active, audit).await
 }
 
 async fn handle<S>(
@@ -140,6 +171,7 @@ async fn handle<S>(
     pool: Arc<ConnectionPool>,
     activity: Arc<AtomicU64>,
     active: Arc<AtomicUsize>,
+    audit: Arc<AuditLog>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -151,6 +183,8 @@ where
     };
     activity.store(now(), Ordering::Relaxed);
     let frame: Frame<Request> = read_frame(&mut stream).await?;
+    let audit_base = audit_fields(&frame.header);
+    audit.append(json!({"timestamp":now(),"stage":"start","request_id":frame.header.id,"readonly":frame.header.readonly,"operation":audit_base.clone()})).await?;
     let id = frame.header.id.clone();
     let result: Result<Frame<Response>> = async {
         match frame.header.method.as_str() {
@@ -183,6 +217,18 @@ where
         }
     }
     .await;
+    let (ok, exit_code, error): (bool, Option<Value>, Option<String>) = match &result {
+        Ok(response) => (
+            response.header.ok,
+            response.header.result.get("exit_code").cloned(),
+            response.header.error.clone(),
+        ),
+        Err(error) => (false, None, Some(error.to_string())),
+    };
+    let completion = json!({"timestamp":now(),"stage":"complete","request_id":frame.header.id,"ok":ok,"exit_code":exit_code,"error":error.as_deref().map(redact_error),"operation":audit_base});
+    if let Err(audit_error) = audit.append(completion).await {
+        eprintln!("sshctx audit completion failed: {audit_error:#}");
+    }
     let response = result.unwrap_or_else(|error| Frame {
         header: Response {
             id: frame.header.id,
@@ -213,6 +259,25 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn audit_fields(request: &Request) -> Value {
+    if request.method != "call" {
+        return json!({"runtime_method":request.method});
+    }
+    let params = request.params.get("params").unwrap_or(&Value::Null);
+    let argv = params.get("argv").and_then(Value::as_array);
+    let command_summary = if let Some(argv) = argv {
+        json!({"program":argv.first().and_then(Value::as_str),"argc":argv.len()})
+    } else if let Some(command) = params.get("command").and_then(Value::as_str) {
+        json!({"shell":true,"characters":command.chars().count()})
+    } else {
+        Value::Null
+    };
+    json!({"host":request.params.get("host"),"type":request.params.get("method"),"cwd":params.get("cwd"),"path":params.get("path"),"command":command_summary})
+}
+fn redact_error(error: &str) -> String {
+    error.chars().take(500).collect()
 }
 
 pub fn default_endpoint() -> Result<String> {
@@ -260,6 +325,7 @@ async fn listen(
     pool: Arc<ConnectionPool>,
     activity: Arc<AtomicU64>,
     active: Arc<AtomicUsize>,
+    audit: Arc<AuditLog>,
 ) -> Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
     let mut first = true;
@@ -272,8 +338,9 @@ async fn listen(
         let pool = Arc::clone(&pool);
         let activity = Arc::clone(&activity);
         let active = Arc::clone(&active);
+        let audit = Arc::clone(&audit);
         tokio::spawn(async move {
-            let _ = handle(server, pool, activity, active).await;
+            let _ = handle(server, pool, activity, active, audit).await;
         });
     }
 }
@@ -283,6 +350,7 @@ async fn listen(
     pool: Arc<ConnectionPool>,
     activity: Arc<AtomicU64>,
     active: Arc<AtomicUsize>,
+    audit: Arc<AuditLog>,
 ) -> Result<()> {
     let path = PathBuf::from(&endpoint);
     if let Some(parent) = path.parent() {
@@ -297,8 +365,9 @@ async fn listen(
         let pool = Arc::clone(&pool);
         let activity = Arc::clone(&activity);
         let active = Arc::clone(&active);
+        let audit = Arc::clone(&audit);
         tokio::spawn(async move {
-            let _ = handle(stream, pool, activity, active).await;
+            let _ = handle(stream, pool, activity, active, audit).await;
         });
     }
 }
