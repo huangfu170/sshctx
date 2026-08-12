@@ -25,7 +25,8 @@ jobs:
           code=$?
           printf '%s\n' "$output"
           if [ "$code" -ne 0 ]; then
-            escaped=${output//'%'/'%25'}
+            diagnostic=$(printf '%s\n' "$output" | tail -n 180)
+            escaped=${diagnostic//'%'/'%25'}
             escaped=${escaped//$'\r'/'%0D'}
             escaped=${escaped//$'\n'/'%0A'}
             echo "::error title=Clippy failure::$escaped"
