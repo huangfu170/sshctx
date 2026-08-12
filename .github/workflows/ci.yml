@@ -6,6 +6,8 @@ on:
 
 jobs:
   rust:
+    env:
+      CARGO_TERM_COLOR: never
     strategy:
       fail-fast: false
       matrix:
@@ -25,7 +27,7 @@ jobs:
           code=$?
           printf '%s\n' "$output"
           if [ "$code" -ne 0 ]; then
-            diagnostic=$(printf '%s\n' "$output" | tail -n 180)
+            diagnostic=$(printf '%s\n' "$output" | tail -n 80)
             escaped=${diagnostic//'%'/'%25'}
             escaped=${escaped//$'\r'/'%0D'}
             escaped=${escaped//$'\n'/'%0A'}
