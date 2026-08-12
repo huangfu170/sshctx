@@ -23,7 +23,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          output=$(cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1)
+          output=$(cargo clippy --locked --workspace --all-targets --all-features -- -D warnings 2>&1)
           code=$?
           printf '%s\n' "$output"
           if [ "$code" -ne 0 ]; then
@@ -34,6 +34,6 @@ jobs:
             echo "::error title=Clippy failure::$escaped"
             exit "$code"
           fi
-      - run: cargo test --workspace --all-features
+      - run: cargo test --locked --workspace --all-features
       - name: Python agent tests
         run: python -m unittest discover -s remote-agent -p "test_*.py" -v
