@@ -129,12 +129,12 @@ impl McpServer {
         )
     )]
     async fn remote_hosts(&self) -> CallToolResult {
-        success(self.tools.hosts().await.and_then(|h| {
-            Ok(format!(
+        success(self.tools.hosts().await.map(|h| {
+            format!(
                 "{}\n(Complete: {} configured hosts shown.)",
                 h.join("\n"),
                 h.len()
-            ))
+            )
         }))
     }
     #[tool(
