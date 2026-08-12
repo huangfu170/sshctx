@@ -231,7 +231,7 @@ impl HostHandle {
             },
         )
         .await?;
-        let response = timeout(
+        let response: Frame<Response> = timeout(
             Duration::from_secs(24 * 60 * 60),
             read_frame(&mut connection.output),
         )
